@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         福建省作品自愿登记系统 - 强制PC版+自动登录+直达首页
 // @namespace    http://tampermonkey.net/
-// @version      17.7
-// @description  覆盖宽度/媒体查询拦截h5；自动登录+自动首页；自动处理"[DID]登录状态已过期"弹窗；过期后默认跳转登录页，加 ?nojump 改为原地重登；v17.5 心跳默认开启（2分钟一次保活），网址加 ?noheartbeat 可关闭
+// @version      18
+// @description  v18：在v17.15基础上进一步加固——降低resize屏蔽日志刷屏、阻止站点手动dispatch resize/orientationchange绕过、优化FormKeeper提交后清空逻辑；事件源防火墙屏蔽resize/orientationchange/matchMedia让站点感知不到窗口变小；FormKeeper实时备份表单、首页弹窗恢复；自动登录+自动首页；自动处理"[DID]登录状态已过期"弹窗；过期后默认跳转登录页，加 ?nojump 改为原地重登；心跳默认开启（2分钟一次保活），网址加 ?noheartbeat 可关闭
 // @author       Heyden Lin
 // @license      MIT
 // @copyright    Copyright (c) 2026 Heyden Lin
@@ -40,7 +40,557 @@
 
   const SKIP_TAGS = new Set(['SCRIPT','STYLE','HEAD','TITLE','META','HTML','BODY','LINK','NOSCRIPT','IFRAME']);
 
-  console.log('[登记助手] v17.7 已加载，unsafeWindow=', W === window ? 'same' : 'got');
+  console.log('[登记助手] v18 已加载，unsafeWindow=', W === window ? 'same' : 'got');
+
+  // ============================================================
+  // 第零阶段：把"强制PC版+导航防火墙"注入页面真实上下文
+  // ============================================================
+  // 原因：v17.9 及之前只在 Tampermonkey 的 unsafeWindow 上改 location/history，
+  //       但页面自身脚本跑在真实 window 上下文，可能根本不经过那层包装，
+  //       所以缩窗时站点调 location.reload()/href=... 还是生效，表单继续丢。
+  // 做法：把一段 <script> 插进页面 DOM，让它在页面真实 window 上跑，
+  //       从源头覆盖 innerWidth/Height、matchMedia 和所有导航 API。
+  // ============================================================
+  function injectIntoPage(fn) {
+    const code = '(' + fn.toString() + ')();';
+    function tryAppend() {
+      if (!document.documentElement) return false;
+      const s = document.createElement('script');
+      s.textContent = code;
+      document.documentElement.appendChild(s);
+      if (s.parentNode) s.parentNode.removeChild(s);
+      return true;
+    }
+    if (tryAppend()) return;
+    // document-start 时 <html> 可能还没出现，轮询到出现再插（仍早于页面脚本）
+    const poll = setInterval(function () {
+      if (tryAppend()) clearInterval(poll);
+    }, 0);
+    // 保险：最多等 1 秒，避免死循环
+    setTimeout(function () { clearInterval(poll); }, 1000);
+  }
+
+  function pageGuard() {
+    (function () {
+      'use strict';
+      const W = window;
+      const D = W.document;
+      const FAKE_W = 1920, FAKE_H = 1080;
+      function log(m) { console.log('[强制PC版·页内]', m); }
+      function stack() { try { return new Error().stack.split('\n').slice(2, 8).join(' | '); } catch (e) { return ''; } }
+
+      // ---------- 1. 强制 PC 尺寸 ----------
+      function defineGet(obj, prop, getter) {
+        try { Object.defineProperty(obj, prop, { get: getter, configurable: true }); }
+        catch (e) {}
+      }
+      defineGet(W, 'innerWidth', () => FAKE_W);
+      defineGet(W, 'innerHeight', () => FAKE_H);
+      defineGet(W, 'outerWidth', () => FAKE_W);
+      defineGet(W, 'outerHeight', () => FAKE_H);
+      if (W.screen) {
+        defineGet(W.screen, 'width', () => FAKE_W);
+        defineGet(W.screen, 'height', () => FAKE_H);
+        defineGet(W.screen, 'availWidth', () => FAKE_W);
+        defineGet(W.screen, 'availHeight', () => FAKE_H);
+      }
+      if (W.visualViewport) {
+        defineGet(W.visualViewport, 'width', () => FAKE_W);
+        defineGet(W.visualViewport, 'height', () => FAKE_H);
+      }
+
+      // ---------- 2. 事件源防火墙（核心） ----------
+      // 站点缩窗时之所以刷新，是因为它在 resize/orientationchange/matchMedia 里写了切换逻辑。
+      // Chrome 禁止修改 location，但我们可以在事件源头阻止站点收到"窗口变了"的通知。
+      const BLOCKED_EVENTS = ['resize', 'orientationchange'];
+      const realAddEventListener = W.addEventListener.bind(W);
+      const realRemoveEventListener = W.removeEventListener.bind(W);
+      const fakeListeners = {};
+      const logCounters = {};
+      function logOnce(key, msg) {
+        // 降低日志噪音：每类事件最多打印 3 次，避免控制台刷屏
+        const n = (logCounters[key] || 0) + 1;
+        logCounters[key] = n;
+        if (n <= 3) log(msg + (n === 3 ? '（后续同类日志已抑制）' : ''));
+      }
+      W.addEventListener = function (type, listener, options) {
+        if (BLOCKED_EVENTS.indexOf(type) !== -1) {
+          logOnce(type, '屏蔽 ' + type + ' 事件监听');
+          if (!fakeListeners[type]) fakeListeners[type] = [];
+          fakeListeners[type].push({ listener: listener, options: options });
+          return;
+        }
+        return realAddEventListener(type, listener, options);
+      };
+      W.removeEventListener = function (type, listener, options) {
+        if (BLOCKED_EVENTS.indexOf(type) !== -1) {
+          const list = fakeListeners[type] || [];
+          for (let i = list.length - 1; i >= 0; i--) {
+            if (list[i].listener === listener) { list.splice(i, 1); break; }
+          }
+          return;
+        }
+        return realRemoveEventListener(type, listener, options);
+      };
+
+      // 屏蔽 onresize / onorientationchange：站点直接读取/调用时必须返回函数，
+      // 否则像 autoMinWidthOnResize 这类代码调用 window.onresize() 会崩溃。
+      const noopFn = function () {};
+      ['onresize', 'onorientationchange'].forEach(function (prop) {
+        try {
+          Object.defineProperty(W, prop, {
+            get() { return noopFn; },
+            set(v) { logOnce(prop, '屏蔽 ' + prop); },
+            configurable: true
+          });
+        } catch (e) {}
+      });
+
+      // 屏蔽 matchMedia 的 addListener / addEventListener
+      const fakeMediaQueryList = {
+        matches: false, media: '', addListener() {}, removeListener() {},
+        addEventListener() {}, removeEventListener() {}, dispatchEvent() { return false; }
+      };
+      try {
+        const realMatchMedia = W.matchMedia.bind(W);
+        W.matchMedia = function (q) {
+          if (typeof q === 'string' && /max(-device)?-width\s*:\s*\d+px/i.test(q)) {
+            logOnce('matchMedia', '屏蔽 matchMedia(' + q + ')');
+            return fakeMediaQueryList;
+          }
+          return realMatchMedia(q);
+        };
+      } catch (e) {}
+
+      // 阻止站点手动 dispatch resize/orientationchange 事件绕过防火墙
+      try {
+        const realDispatch = W.EventTarget.prototype.dispatchEvent;
+        W.EventTarget.prototype.dispatchEvent = function (event) {
+          if (event && BLOCKED_EVENTS.indexOf(event.type) !== -1) {
+            logOnce('dispatch:' + event.type, '阻止手动 dispatch ' + event.type);
+            return true;
+          }
+          return realDispatch.call(this, event);
+        };
+      } catch (e) {}
+
+      // ---------- 3. 拦截键盘刷新 ----------
+      W.addEventListener('keydown', function (e) {
+        if (e.key === 'F5' || ((e.ctrlKey || e.metaKey) && (e.key === 'r' || e.key === 'R'))) {
+          log('拦截键盘刷新');
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      }, true);
+
+      // ---------- 4. beforeunload 挽留（仅当有未保存草稿时才弹，避免正常操作打扰） ----------
+      const FK_KEY = '__fjCopyrightFormDraft_v17';
+      function hasFormDraft() {
+        try {
+          const raw = W.sessionStorage.getItem(FK_KEY);
+          if (!raw) return false;
+          const draft = JSON.parse(raw);
+          if (!draft || !draft.data || !draft.data.length) return false;
+          return (Date.now() - draft.savedAt) < 30 * 60 * 1000;
+        } catch (e) { return false; }
+      }
+      W.addEventListener('beforeunload', function (e) {
+        if (!hasFormDraft()) return;
+        log('beforeunload 触发，有未保存草稿，尝试挽留 @ ' + stack());
+        e.preventDefault();
+        e.returnValue = '页面即将刷新/跳转，表单数据可能丢失。确定要离开吗？';
+        return e.returnValue;
+      });
+
+      // ---------- 5. click / submit 拦截 /h5/ 和自刷新 ----------
+      const BLOCK = '/h5';
+      function isSelfNav(u) {
+        try {
+          const cur = W.location.origin + W.location.pathname + W.location.search;
+          let target;
+          if (u === '' || u == null) target = cur;
+          else { const a = D.createElement('a'); a.href = u; target = a.origin + a.pathname + a.search; }
+          return target === cur;
+        } catch (e) { return false; }
+      }
+      function blocked(u) {
+        if (typeof u !== 'string') return false;
+        const s = u.toLowerCase();
+        return s.indexOf(BLOCK) !== -1 || isSelfNav(u);
+      }
+      D.addEventListener('click', function (e) {
+        const a = e.target && e.target.closest ? e.target.closest('a') : null;
+        if (a) {
+          const h = a.getAttribute ? a.getAttribute('href') : '';
+          if (blocked(h)) { log('拦截 a 跳转 -> ' + h); e.preventDefault(); e.stopPropagation(); }
+        }
+      }, true);
+      D.addEventListener('submit', function (e) {
+        const action = e.target.getAttribute('action') || W.location.href;
+        if (blocked(action)) { log('拦截 form submit -> ' + action); e.preventDefault(); e.stopPropagation(); }
+      }, true);
+
+      // ---------- 6. history.pushState/replaceState 拦 /h5/ ----------
+      ['pushState', 'replaceState'].forEach(function (fn) {
+        try {
+          const orig = W.history[fn];
+          W.history[fn] = function (state, title, url) {
+            if (typeof url === 'string' && url.toLowerCase().indexOf(BLOCK) !== -1) {
+              log('拦截 history.' + fn + ' -> ' + url); return;
+            }
+            return orig.apply(this, arguments);
+          };
+        } catch (e) {}
+      });
+
+      // ---------- 7. 移除 meta refresh ----------
+      function killMetaRefresh() {
+        D.querySelectorAll('meta[http-equiv="refresh"]').forEach(function (m) { log('移除 meta refresh'); m.remove(); });
+      }
+      if (D.readyState !== 'loading') killMetaRefresh();
+      else D.addEventListener('DOMContentLoaded', killMetaRefresh);
+
+      // ---------- 8. 注入 CSS 强制 min-width ----------
+      function injectCSS() {
+        try {
+          const style = D.createElement('style');
+          style.textContent = 'html, body { min-width: 1920px !important; overflow-x: auto !important; }';
+          if (D.head) D.head.appendChild(style);
+          else if (D.documentElement) D.documentElement.appendChild(style);
+        } catch (e) {}
+      }
+      if (D.readyState !== 'loading') injectCSS();
+      else D.addEventListener('DOMContentLoaded', injectCSS);
+
+      // ---------- 9. H5 检测拉回 ----------
+      function isOnH5() { try { return W.location.pathname.indexOf('/h5/') === 0; } catch (e) { return false; } }
+      function pullBackFromH5() {
+        if (isOnH5()) {
+          log('检测到 H5 URL，自动拉回 /indexPage');
+          try { W.location.replace('/indexPage'); } catch (e) {}
+        }
+      }
+      W.setInterval(pullBackFromH5, 1000);
+
+      W.__fjCopyrightGuardInjected = 'v18';
+      log('v18 事件源防火墙已注入（屏蔽 resize/orientationchange/matchMedia/dispatchEvent）');
+    })();
+  }
+
+  injectIntoPage(pageGuard);
+
+  // ============================================================
+  // 阶段 0.5：FormKeeper 表单保险柜
+  // 原因：Chrome 对 Location 对象保护极严，某些整页重载可能终究无法
+  //       100% 阻止。与其让用户丢数据，不如把填写的表单实时备份到
+  //       sessionStorage，刷新/被踢回首页后再回到原页面时自动回填。
+  // 触发保存：input / change / blur（节流 300ms）。
+  // 自动恢复：DOM 稳定后，如果当前页与保存的 path 一致则回填。
+  // 自动清除：检测到提交成功（按钮文案含"提交"/"保存"/"确定"且页面跳转/弹成功）。
+  // ============================================================
+  const FormKeeper = (function () {
+      const KEY = '__fjCopyrightFormDraft_v17';
+      const MAX_AGE_MS = 30 * 60 * 1000; // 30 分钟过期
+      const SUBMITTED_FLAG = '__fjCopyrightSubmitted_v17';
+      let saveTimer = null;
+      const restoredPaths = new Set(); // 按 path 记录已恢复过的页面，避免重复恢复
+
+    function currentPath() { return W.location.pathname + W.location.search; }
+
+    function isEditablePage() {
+      // 只在登记/填报相关页面保存，避免在登录页/首页乱存
+      const p = W.location.pathname.toLowerCase();
+      return /(register|apply|edit|fill|work|copyright|登记|填报|作品)/i.test(p);
+    }
+
+    function hasFormDraft() {
+      try {
+        const raw = W.sessionStorage.getItem(KEY);
+        if (!raw) return false;
+        const draft = JSON.parse(raw);
+        if (!draft || !draft.data || !draft.data.length) return false;
+        return (Date.now() - draft.savedAt) < MAX_AGE_MS;
+      } catch (e) { return false; }
+    }
+
+    function getSelector(el) {
+      if (el.name) return 'name:' + el.name;
+      if (el.id) return 'id:' + el.id;
+      return null;
+    }
+
+    function gather() {
+      const data = [];
+      const seen = new Set();
+      const inputs = W.document.querySelectorAll('input, textarea, select');
+      for (const el of inputs) {
+        const sel = getSelector(el);
+        if (!sel || seen.has(sel)) continue;
+        if (el.type === 'password' || el.name === 'password' || el.type === 'hidden' || el.disabled) continue;
+        seen.add(sel);
+        let v;
+        if (el.type === 'checkbox') v = { t: 'cb', v: el.checked };
+        else if (el.type === 'radio') v = { t: 'radio', v: el.checked ? el.value : null };
+        else if (el.tagName === 'SELECT' && el.multiple) v = { t: 'select-m', v: Array.from(el.selectedOptions).map(o => o.value) };
+        else v = { t: 'text', v: el.value };
+        data.push({ sel, tag: el.tagName, type: el.type || '', v });
+      }
+      return { path: currentPath(), savedAt: Date.now(), url: W.location.href, data };
+    }
+
+    function save(force) {
+      try {
+        if (!force && !isEditablePage()) return;
+        const draft = gather();
+        if (!draft.data.length) return;
+        W.sessionStorage.setItem(KEY, JSON.stringify(draft));
+      } catch (e) { console.log('[FormKeeper] 保存失败:', e.message); }
+    }
+
+    function debouncedSave() {
+      if (saveTimer) W.clearTimeout(saveTimer);
+      saveTimer = W.setTimeout(save, 300);
+    }
+
+    function forceSaveNow() {
+      if (saveTimer) W.clearTimeout(saveTimer);
+      save(true);
+    }
+
+    function restore() {
+      const cp = currentPath();
+      if (restoredPaths.has(cp)) return false;
+      try {
+        const raw = W.sessionStorage.getItem(KEY);
+        if (!raw) return false;
+        const draft = JSON.parse(raw);
+        if (!draft || !draft.data) { W.sessionStorage.removeItem(KEY); return false; }
+        if (draft.path !== cp) return false;
+        if (Date.now() - draft.savedAt > MAX_AGE_MS) { W.sessionStorage.removeItem(KEY); return false; }
+
+        let restoredCount = 0;
+        for (const item of draft.data) {
+          let el = null;
+          if (item.sel.indexOf('name:') === 0) {
+            el = W.document.querySelector('[name="' + item.sel.slice(5).replace(/"/g, '\\"') + '"]');
+          } else if (item.sel.indexOf('id:') === 0) {
+            el = W.document.getElementById(item.sel.slice(3));
+          }
+          if (!el) continue;
+          try {
+            if (item.v.t === 'cb') el.checked = item.v.v;
+            else if (item.v.t === 'radio') {
+              if (item.v.v != null) {
+                const r = W.document.querySelector('[name="' + (item.sel.slice(5).replace(/"/g, '\\"')) + '"][value="' + String(item.v.v).replace(/"/g, '\\"') + '"]');
+                if (r) r.checked = true;
+              }
+            }
+            else if (item.v.t === 'select-m') {
+              Array.from(el.options).forEach(o => o.selected = item.v.v.includes(o.value));
+            }
+            else {
+              el.value = item.v.v;
+              // 触发 React/Vue 绑定的输入事件，让组件状态同步
+              const ev1 = new W.Event('input', { bubbles: true });
+              const ev2 = new W.Event('change', { bubbles: true });
+              el.dispatchEvent(ev1);
+              el.dispatchEvent(ev2);
+            }
+            restoredCount++;
+          } catch (e) {}
+        }
+        restoredPaths.add(cp);
+        console.log('[FormKeeper] 已自动恢复 ' + restoredCount + '/' + draft.data.length + ' 个字段');
+        // 恢复成功后，如果首页有“恢复刚才的登记”浮动按钮，移除它
+        const oldBtn = W.document.getElementById('__fjRestoreBtn');
+        if (oldBtn) oldBtn.remove();
+        return restoredCount > 0;
+      } catch (e) {
+        console.log('[FormKeeper] 恢复失败:', e.message);
+        return false;
+      }
+    }
+
+    function isHomePage() {
+      const p = W.location.pathname.toLowerCase();
+      if (p === '/' || p === '/indexpage' || p === '/index' || p === '/home') return true;
+      const bodyText = (W.document.body && W.document.body.textContent || '').replace(/\s+/g, ' ');
+      return /首页|工作台|快捷菜单|作品总数|待审核作品/.test(bodyText) && !/(在线填报|作品登记|在线登记)/.test(bodyText);
+    }
+
+    function offerRestoreIfHome() {
+      if (!isHomePage()) return;
+      try {
+        const raw = W.sessionStorage.getItem(KEY);
+        if (!raw) return;
+        const draft = JSON.parse(raw);
+        if (!draft || !draft.data || !draft.data.length) return;
+        if (Date.now() - draft.savedAt > MAX_AGE_MS) { clear(); return; }
+        if (draft.path === currentPath()) return; // 已经在目标页
+        if (W.document.getElementById('__fjRestoreBtn')) return;
+
+        const container = W.document.createElement('div');
+        container.id = '__fjRestoreBtn';
+        container.style.cssText = 'position:fixed;z-index:99999;left:50%;top:50%;transform:translate(-50%,-50%);background:#fff;border:2px solid #1677ff;border-radius:12px;padding:24px;box-shadow:0 8px 32px rgba(0,0,0,.2);font-family:sans-serif;max-width:360px;text-align:center;';
+        const title = W.document.createElement('div');
+        title.textContent = '检测到未完成的登记草稿';
+        title.style.cssText = 'font-size:18px;font-weight:bold;color:#1677ff;margin-bottom:12px;';
+        const desc = W.document.createElement('div');
+        desc.textContent = '刚才填写的内容已自动保存（' + draft.data.length + ' 项）。是否回到原页面继续填写？';
+        desc.style.cssText = 'font-size:14px;color:#333;margin-bottom:20px;line-height:1.6;';
+        const btnRow = W.document.createElement('div');
+        btnRow.style.cssText = 'display:flex;gap:12px;justify-content:center;';
+        const okBtn = W.document.createElement('button');
+        okBtn.textContent = '继续填写';
+        okBtn.style.cssText = 'padding:10px 20px;background:#1677ff;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;';
+        okBtn.onclick = function () {
+          W.sessionStorage.setItem('__fjCopyrightRestorePending', '1');
+          W.location.href = draft.url;
+        };
+        const cancelBtn = W.document.createElement('button');
+        cancelBtn.textContent = '丢弃草稿';
+        cancelBtn.style.cssText = 'padding:10px 20px;background:#f0f0f0;color:#555;border:none;border-radius:6px;cursor:pointer;font-size:14px;';
+        cancelBtn.onclick = function () { clear(); container.remove(); };
+        btnRow.appendChild(okBtn);
+        btnRow.appendChild(cancelBtn);
+        container.appendChild(title);
+        container.appendChild(desc);
+        container.appendChild(btnRow);
+
+        // 加一个遮罩，确保用户一定看得到
+        const mask = W.document.createElement('div');
+        mask.id = '__fjRestoreMask';
+        mask.style.cssText = 'position:fixed;z-index:99998;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,.45);';
+
+        if (W.document.body) {
+          W.document.body.appendChild(mask);
+          W.document.body.appendChild(container);
+        }
+        console.log('[FormKeeper] 在首页显示恢复弹窗:', draft.url);
+      } catch (e) {}
+    }
+
+    function clear() {
+      try {
+        W.sessionStorage.removeItem(KEY);
+        restoredPaths.clear();
+        const btn = W.document.getElementById('__fjRestoreBtn');
+        const mask = W.document.getElementById('__fjRestoreMask');
+        if (btn) btn.remove();
+        if (mask) mask.remove();
+      } catch (e) {}
+    }
+
+    function watchInputs() {
+      if (!W.document.body) return;
+      // 监听输入事件（节流保存）
+      W.document.body.addEventListener('input', debouncedSave, true);
+      W.document.body.addEventListener('change', debouncedSave, true);
+      W.document.body.addEventListener('blur', debouncedSave, true);
+      // 页面隐藏前强制保存
+      W.document.addEventListener('visibilitychange', function () {
+        if (W.document.visibilityState === 'hidden') forceSaveNow();
+      });
+      // 监听提交成功：点提交/保存类按钮后，把草稿标记为"已提交待确认"，
+      // 后续检测到成功提示、页面离开或一段时间无错误则清空。
+      W.document.body.addEventListener('click', function (e) {
+        const el = e.target;
+        if (!el || el.nodeType !== 1) return;
+        const t = (el.textContent || el.innerText || el.value || '').replace(/\s+/g, '');
+        if (/提交|保存|确定|立即提交|确认提交|保存草稿/i.test(t)) {
+          forceSaveNow();
+          // 标记"已提交"，并把当前草稿也保存一份副本作为比对基线
+          try { W.sessionStorage.setItem(SUBMITTED_FLAG, JSON.stringify({ path: currentPath(), time: Date.now() })); } catch (e) {}
+          // 3 秒后如果还在本页且没有错误提示/成功提示未触发清空，兜底清空
+          W.setTimeout(checkSubmitResult, 3000);
+          // 10 秒后再检查一次（给 SPA 跳转/弹窗留足时间）
+          W.setTimeout(checkSubmitResult, 10000);
+        }
+      }, true);
+
+      // 在页面中扫描"成功"提示：保存成功、提交成功、操作成功等
+      function detectSuccess() {
+        if (!W.document.body) return false;
+        const bodyText = (W.document.body.textContent || '').replace(/\s+/g, ' ');
+        return /保存成功|提交成功|操作成功|保存草稿成功|提交申请成功|数据已保存/.test(bodyText);
+      }
+      function detectError() {
+        if (!W.document.body) return false;
+        const bodyText = (W.document.body.textContent || '').replace(/\s+/g, ' ');
+        return /失败|错误|异常|请重试|不能为空|校验未通过|提交失败|保存失败/.test(bodyText);
+      }
+      function checkSubmitResult() {
+        try {
+          const submitted = W.sessionStorage.getItem(SUBMITTED_FLAG);
+          if (!submitted) return;
+          const info = JSON.parse(submitted);
+          if (info.path !== currentPath()) {
+            // 页面已离开原填报页，认为提交流程已结束，清空草稿
+            clear();
+            return;
+          }
+          if (detectSuccess()) {
+            console.log('[FormKeeper] 检测到成功提示，清空草稿');
+            clear();
+            return;
+          }
+          // 兜底：提交 10 秒后无错误也清空（如果还在原页，可能是保存草稿在原页，也可清）
+          if (Date.now() - info.time > 9000 && !detectError()) {
+            console.log('[FormKeeper] 提交后无错误提示，清空草稿（兜底）');
+            clear();
+          }
+        } catch (e) {}
+      }
+    }
+
+    function init() {
+      if (!W.sessionStorage) return;
+      function onReady() {
+        watchInputs();
+        restore();
+        offerRestoreIfHome();
+      }
+      if (W.document.readyState === 'loading') {
+        W.document.addEventListener('DOMContentLoaded', onReady);
+      } else {
+        onReady();
+      }
+      // beforeunload 时强制同步保存（关键：确保最后一刻数据不丢）
+      W.addEventListener('beforeunload', function () {
+        forceSaveNow();
+        // 如果之前点了提交按钮且页面现在要离开了，清空草稿避免旧数据复活
+        try {
+          const submitted = W.sessionStorage.getItem(SUBMITTED_FLAG);
+          if (submitted) {
+            const info = JSON.parse(submitted);
+            if (info.path && info.path !== currentPath()) clear();
+          }
+        } catch (e) {}
+      });
+      // 页面可见性变化：切走前保存；切回后检查是否提交成功
+      W.document.addEventListener('visibilitychange', function () {
+        if (W.document.visibilityState === 'hidden') forceSaveNow();
+        else if (W.document.visibilityState === 'visible') {
+          checkSubmitResult();
+        }
+      });
+      // 每 5 秒再尝试恢复一次（应对 SPA 异步渲染），但按 path 去重
+      W.setInterval(function () { restore(); }, 5000);
+      // 每 3 秒检查一次是否在首页且有可恢复草稿
+      W.setInterval(offerRestoreIfHome, 3000);
+      // URL 变化监听（hashchange/popstate）
+      W.addEventListener('hashchange', function () {
+        W.setTimeout(function () { restore(); offerRestoreIfHome(); checkSubmitResult(); }, 0);
+      });
+      W.addEventListener('popstate', function () {
+        W.setTimeout(function () { restore(); offerRestoreIfHome(); checkSubmitResult(); }, 0);
+      });
+    }
+
+    return { init, save, restore, clear, gather };
+  })();
+
+  FormKeeper.init();
 
   // ============================================================
   // 第一阶段：覆盖宽度 / 媒体查询
@@ -93,6 +643,55 @@
         return origOpen.apply(this, arguments);
       };
     } catch (e) { console.log('[强制PC版] window.open 失败:', e.message); }
+  })();
+
+  // ============================================================
+  // 第二阶段·补：userscript 层辅助拦截
+  // 说明：Chrome 对 location 对象保护极严，直接修改 location.reload / href / assign / replace
+  //       都会报"Cannot assign to read only property"而失败。这部分只保留不会报错的事件拦截：
+  //       - a 标签点击跳 /h5/ 或自刷新
+  //       - history.go(0)
+  //       真正的缩窗刷新源头已在 pageGuard 里用"事件源防火墙"处理（屏蔽 resize/orientationchange/matchMedia）。
+  // ============================================================
+  (function setupNavGuard() {
+    const BLOCK = '/h5';
+    function isSelfNav(u) {
+      try {
+        const cur = W.location.origin + W.location.pathname + W.location.search;
+        let target;
+        if (u === '' || u == null) target = cur;
+        else {
+          const a = W.document.createElement('a'); a.href = u;
+          target = a.origin + a.pathname + a.search;
+        }
+        return target === cur;
+      } catch (e) { return false; }
+    }
+    function blocked(u) {
+      if (typeof u !== 'string') return false;
+      const s = u.toLowerCase();
+      return s.indexOf(BLOCK) !== -1 || isSelfNav(u);
+    }
+    // history.go(0) 拦截
+    try {
+      const og = W.history.go.bind(W.history);
+      W.history.go = function (n) { if (n === 0 || n == null) { console.log('[强制PC版] 拦截 history.go(0) 刷新'); return; } return og(n); };
+    } catch (e) { console.log('[强制PC版] history.go 拦截失败:', e.message); }
+    // a 标签点击跳转
+    function onDoc() {
+      try {
+        W.document.addEventListener('click', function (e) {
+          const t = e.target;
+          const a = (t && t.closest) ? t.closest('a') : null;
+          if (a) {
+            const h = a.getAttribute ? a.getAttribute('href') : '';
+            if (blocked(h)) { e.preventDefault(); e.stopPropagation(); console.log('[强制PC版] 拦截 a 跳转 ->', h); }
+          }
+        }, true);
+      } catch (e) { console.log('[强制PC版] a 标签拦截失败:', e.message); }
+    }
+    if (W.document && W.document.readyState !== 'loading') onDoc();
+    else W.addEventListener('DOMContentLoaded', onDoc);
   })();
 
   if (W.location.pathname.indexOf('/h5/') === 0) {
